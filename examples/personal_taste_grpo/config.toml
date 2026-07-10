@@ -1,0 +1,48 @@
+[run]
+model_id = "mlx-community/Qwen3.5-4B-MLX-4bit"
+steps = 100
+group_size = 8
+max_completion_len = 16
+seed = 7
+kl_beta = 0.10
+rank = 16
+scale = 2.0
+dropout = 0.0
+gradient_checkpointing = true
+micro_batch_size = 0
+checkpoint_every = 25
+rollout_attempts_per_step = 4
+brief_attempts_per_step = 16
+max_family_count = 2
+output_dir = "outputs/personal_taste_grpo"
+
+[optimizer]
+learning_rate = 0.000001
+
+[sampling]
+temperature = 1.1
+top_p = 0.98
+min_p = 0.0
+top_k = 100
+
+[data]
+briefs = "data/briefs.json"
+scorer = "data/scorer.json"
+
+[reward]
+taste_weight = 0.85
+aux_weight = 0.15
+banned_penalty = 0.25
+unreadable_penalty = 0.35
+genericity_penalty = 0.20
+invalid_name_penalty = 0.65
+low_information_penalty = 0.75
+short_name_penalty = 0.20
+duplicate_penalty = 1.00
+family_duplicate_penalty = 1.00
+family_duplicate_guardrail_threshold = 0.25
+guardrail_scorer_cap = -0.75
+literal_copy_penalty = 0.65
+literal_copy_guardrail_threshold = 0.50
+brief_adherence_bonus = 0.08
+diversity_bonus = 0.08
