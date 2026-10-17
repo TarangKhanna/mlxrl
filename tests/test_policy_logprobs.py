@@ -277,3 +277,87 @@ def test_batch_from_rollouts_recomputes_old_policy_logprobs() -> None:
     assert batch.mask.tolist() == [[1.0, 1.0], [1.0, 0.0]]
     assert batch.logprob_inputs is not None
     assert model.cached_call_shapes == [(1, 2), (2, 2)]
+
+
+def _tiny_qwen3(tie_word_embeddings: bool) -> nn.Module:
+    from mlx_lm.models.qwen3 import Model, ModelArgs
+
+    mx.random.seed(0)
+    args = ModelArgs(
+        model_type="qwen3",
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=50,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        rope_theta=10000.0,
+        head_dim=8,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    model = Model(args)
+    mx.eval(model.parameters())  # Test sync: materialize random weights.
+    return model
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [True, False])
+def test_completion_logprobs_match_log_softmax_of_full_logits_with_gradients(
+    tie_word_embeddings: bool,
+) -> None:
+    """Completion logprobs are log_softmax(model(tokens)) at the predicting positions."""
+
+    model = _tiny_qwen3(tie_word_embeddings)
+    prompts = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]]
+    completions = [[13, 14, 15], [16]]
+    inputs = prepare_completion_logprob_inputs(prompts, completions)
+
+    def explicit(params_model: nn.Module) -> mx.array:
+        logits = params_model(inputs.input_ids)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        picked = mx.squeeze(
+            mx.take_along_axis(logprobs, inputs.target_ids[..., None], axis=-1), axis=-1
+        )
+        return mx.take_along_axis(picked, inputs.gather_indices, axis=1) * inputs.mask
+
+    def actual(params_model: nn.Module) -> mx.array:
+        return completion_logprobs_from_inputs(params_model, inputs).logprobs
+
+    def loss(fn: object) -> object:
+        return lambda m: mx.sum(fn(m) * mx.arange(1, 4, dtype=mx.float32)[None, :])  # type: ignore[operator]
+
+    value, grads = nn.value_and_grad(model, loss(actual))(model)
+    ref_value, ref_grads = nn.value_and_grad(model, loss(explicit))(model)
+    from mlx.utils import tree_flatten
+
+    flat = dict(tree_flatten(grads))
+    ref_flat = dict(tree_flatten(ref_grads))
+    errors = [mx.max(mx.abs(flat[k] - ref_flat[k])) for k in ref_flat]
+    mx.eval(value, ref_value, *errors)  # Test sync: materialize comparisons.
+
+    assert abs(float(value.item()) - float(ref_value.item())) < 1e-5
+    assert max(float(e.item()) for e in errors) < 1e-5
+    assert max(float(mx.max(mx.abs(g)).item()) for g in flat.values()) > 0.0
+
+
+def test_completion_logprobs_project_only_completion_positions() -> None:
+    """The vocab projection must see [batch, max_completion_len] rows, not the whole sequence."""
+
+    model = _tiny_qwen3(tie_word_embeddings=True)
+    seen: list[tuple[int, ...]] = []
+    embed = model.model.embed_tokens
+    original = type(embed).as_linear
+
+    def spy(self: nn.Module, x: mx.array) -> mx.array:
+        seen.append(tuple(x.shape))
+        return original(self, x)
+
+    type(embed).as_linear = spy  # type: ignore[method-assign]
+    try:
+        inputs = prepare_completion_logprob_inputs([[1, 2, 3, 4, 5, 6]] * 2, [[7, 8, 9], [10]])
+        mx.eval(completion_logprobs_from_inputs(model, inputs).logprobs)  # Test sync.
+    finally:
+        type(embed).as_linear = original  # type: ignore[method-assign]
+
+    assert seen == [(2, 3, 32)]
