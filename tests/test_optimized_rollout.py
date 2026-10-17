@@ -179,3 +179,116 @@ def test_random_batched_rollout_keeps_fallback_on_first_token_eos(
         ((99,), (-0.5,), "fallback"),
         ((99,), (-0.5,), "fallback"),
     )
+
+
+class _StateOnlyCache:
+    """Cache API without meta_state: from_state takes only the state."""
+
+    def __init__(self, keys: mx.array) -> None:
+        self.keys = keys
+
+    @property
+    def state(self) -> tuple[mx.array]:
+        return (self.keys,)
+
+    @classmethod
+    def from_state(cls, state: tuple[mx.array]) -> _StateOnlyCache:
+        return cls(state[0])
+
+
+def test_clone_prompt_cache_supports_caches_without_meta_state() -> None:
+    original = _StateOnlyCache(mx.arange(6).reshape(2, 3))
+
+    (clone,) = optimized_module.clone_prompt_cache([original])
+
+    assert isinstance(clone, _StateOnlyCache)
+    assert clone.keys is not original.keys
+    assert mx.array_equal(clone.keys, original.keys).item()
+
+
+def _filled_kv(cls, **kwargs):
+    from mlx_lm.models import cache as mlx_cache
+
+    keys = mx.arange(2 * 2 * 5 * 64, dtype=mx.float32).reshape(2, 2, 5, 64) / 100
+    cache = getattr(mlx_cache, cls)(**kwargs)
+    cache.update_and_fetch(keys, keys + 1)
+    return cache
+
+
+def _arrays_cache():
+    from mlx_lm.models.cache import ArraysCache
+
+    cache = ArraysCache(2)
+    cache[0] = mx.arange(6, dtype=mx.float32).reshape(1, 2, 3)
+    cache[1] = mx.ones((1, 4))
+    return cache
+
+
+def _cache_list():
+    from mlx_lm.models.cache import CacheList
+
+    return CacheList(_filled_kv("KVCache"), _filled_kv("RotatingKVCache", max_size=8))
+
+
+def _build(name: str):
+    if name == "ArraysCache":
+        return _arrays_cache()
+    if name == "CacheList":
+        return _cache_list()
+    if name == "QuantizedKVCache":
+        return _filled_kv("KVCache").to_quantized(group_size=64, bits=4)
+    if name == "RotatingKVCache":
+        return _filled_kv(name, max_size=8)
+    return _filled_kv(name)
+
+
+def _arrays(value):
+    if isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [a for item in value for a in _arrays(item)]
+    return []
+
+
+def _nonarray(value):
+    if isinstance(value, mx.array):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_nonarray(item) for item in value]
+    return value
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["KVCache", "RotatingKVCache", "QuantizedKVCache", "ArraysCache", "CacheList"],
+)
+def test_clone_prompt_cache_clones_mlx_lm_caches(name: str) -> None:
+    original = _build(name)
+
+    (clone,) = optimized_module.clone_prompt_cache([original])
+
+    # Rule: a clone has the same type and the same cached content and
+    # bookkeeping as the original, but shares no array storage with it.
+    assert type(clone) is type(original)
+    assert _nonarray(clone.state) == _nonarray(original.state)
+    assert getattr(clone, "offset", None) == getattr(original, "offset", None)
+    clone_arrays, original_arrays = _arrays(clone.state), _arrays(original.state)
+    assert len(clone_arrays) == len(original_arrays) > 0
+    for new, old in zip(clone_arrays, original_arrays, strict=True):
+        assert new is not old
+        assert mx.array_equal(new, old).item()
+    if hasattr(original, "meta_state"):  # mlx-lm < 0.32 only
+        assert clone.meta_state == original.meta_state
+
+
+def test_clone_prompt_cache_clone_is_independent_of_original() -> None:
+    original = _filled_kv("KVCache")
+    before = mx.array(original.state[0])
+
+    (clone,) = optimized_module.clone_prompt_cache([original])
+    step = mx.ones((2, 2, 1, 64))
+    clone.update_and_fetch(step, step)
+
+    assert original.offset == 5
+    assert clone.offset == 6
+    assert mx.array_equal(original.state[0], before).item()
