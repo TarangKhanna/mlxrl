@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
+import mlxrl.policy.logprobs as logprobs_module
 from mlxrl.algo.grpo import GRPOAlgorithm
 from mlxrl.policy.logprobs import (
+    CompletionLogprobInputs,
     completion_logprobs,
     completion_logprobs_from_inputs,
     dual_logprobs,
@@ -277,3 +281,125 @@ def test_batch_from_rollouts_recomputes_old_policy_logprobs() -> None:
     assert batch.mask.tolist() == [[1.0, 1.0], [1.0, 0.0]]
     assert batch.logprob_inputs is not None
     assert model.cached_call_shapes == [(1, 2), (2, 2)]
+
+
+PROMPTS = [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10], [11, 12, 13, 14, 15]]
+COMPLETIONS = [[20, 21, 22, 23], [24], [25, 26]]
+
+
+def _tiny_model(arch: str, tie: bool, dtype: mx.Dtype = mx.float32, quantize: bool = False) -> nn.Module:
+    if arch == "qwen3":
+        from mlx_lm.models.qwen3 import Model, ModelArgs
+
+        extra = {"rope_theta": 10000.0, "head_dim": 8}
+    else:
+        from mlx_lm.models.llama import Model, ModelArgs
+
+        extra = {}
+    mx.random.seed(0)
+    args = ModelArgs(
+        model_type=arch,
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=50,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        tie_word_embeddings=tie,
+        **extra,
+    )
+    model = Model(args)
+    model.set_dtype(dtype)
+    if quantize:
+        nn.quantize(model, group_size=32, bits=4)
+    mx.eval(model.parameters())  # Test sync: materialize random weights.
+    return model
+
+
+def _logprobs_and_grads(
+    model: nn.Module, inputs: CompletionLogprobInputs, weights: mx.array
+) -> tuple[mx.array, dict[str, mx.array]]:
+    def loss(m: nn.Module) -> mx.array:
+        out = completion_logprobs_from_inputs(m, inputs).logprobs.astype(mx.float32)
+        return mx.sum(out * weights)
+
+    value, grads = nn.value_and_grad(model, loss)(model)
+    logprobs = completion_logprobs_from_inputs(model, inputs).logprobs
+    flat = dict(tree_flatten(grads))
+    mx.eval(value, logprobs, *flat.values())  # Test sync: materialize comparisons.
+    return logprobs, flat
+
+
+def _max_diff(a: mx.array, b: mx.array) -> float:
+    return float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item())
+
+
+@pytest.mark.parametrize(
+    ("arch", "tie", "dtype", "quantize", "tol"),
+    [
+        ("qwen3", True, mx.float32, False, 1e-5),
+        ("qwen3", False, mx.float32, False, 1e-5),
+        ("llama", True, mx.float32, False, 1e-5),
+        ("llama", False, mx.float32, False, 1e-5),
+        ("qwen3", True, mx.float32, True, 1e-5),
+        # bf16 ulp near |logprob|=4 is 2^-5; fp32 diffs measured <= 5e-7 (logprobs), 5e-6 (grads)
+        ("qwen3", True, mx.bfloat16, False, 0.0625),
+    ],
+)
+def test_completion_head_matches_full_logits(
+    monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    tie: bool,
+    dtype: mx.Dtype,
+    quantize: bool,
+    tol: float,
+) -> None:
+    """Applying the head at completion rows only equals applying it everywhere."""
+
+    model = _tiny_model(arch, tie, dtype, quantize)
+    assert logprobs_module._completion_head(model) is not None
+    inputs = prepare_completion_logprob_inputs(PROMPTS, COMPLETIONS)
+    weights = mx.arange(1, 5, dtype=mx.float32)[None, :]
+
+    got, got_grads = _logprobs_and_grads(model, inputs, weights)
+    monkeypatch.setattr(logprobs_module, "_completion_head", lambda m: None)
+    ref, ref_grads = _logprobs_and_grads(model, inputs, weights)
+
+    assert _max_diff(got, ref) <= tol
+    assert got.shape == ref.shape
+    assert max(float(mx.max(mx.abs(g)).item()) for g in ref_grads.values()) > 0.0
+    assert max(_max_diff(got_grads[k], ref_grads[k]) for k in ref_grads) <= max(tol, 1e-4)
+
+
+def test_completion_head_comparison_detects_misaligned_gather() -> None:
+    model = _tiny_model("qwen3", True)
+    inputs = prepare_completion_logprob_inputs(PROMPTS, COMPLETIONS)
+    shifted = dataclasses.replace(inputs, gather_indices=inputs.gather_indices + 1)
+    good = completion_logprobs_from_inputs(model, inputs).logprobs
+    bad = completion_logprobs_from_inputs(model, shifted).logprobs
+    mx.eval(good, bad)  # Test sync.
+    assert _max_diff(good, bad) > 1e-2
+
+
+def test_completion_head_sees_only_completion_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _tiny_model("qwen3", True)
+    embed_cls = type(model.model.embed_tokens)
+    original = embed_cls.as_linear
+    seen: list[tuple[int, ...]] = []
+
+    def spy(self: nn.Module, x: mx.array) -> mx.array:
+        seen.append(tuple(x.shape))
+        return original(self, x)
+
+    monkeypatch.setattr(embed_cls, "as_linear", spy)
+    inputs = prepare_completion_logprob_inputs(PROMPTS, COMPLETIONS)
+    mx.eval(completion_logprobs_from_inputs(model, inputs).logprobs)  # Test sync.
+    assert seen == [(3, 4, 32)]
+
+
+def test_unlisted_model_type_uses_full_forward() -> None:
+    model = _tiny_model("qwen3", True)
+    model.args.model_type = "gemma3"
+    assert logprobs_module._completion_head(model) is None
