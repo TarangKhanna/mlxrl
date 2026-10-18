@@ -395,6 +395,43 @@ def test_completion_head_matches_full_logits(
     assert max(_max_diff(got_grads[k], ref_grads[k]) for k in ref_grads) <= max(tol, 1e-4)
 
 
+def test_completion_head_matches_full_logits_with_lora_and_checkpointing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loss and LoRA adapter gradients equal the full-forward path's under checkpointing."""
+
+    from mlxrl.policy.model import LoRAConfig, inject_lora_adapters
+
+    model = _tiny_model("qwen3", True)
+    inject_lora_adapters(model, LoRAConfig(rank=4, grad_checkpoint=True))
+    # lora_b starts at zero, which would zero every lora_a gradient; make both factors live.
+    adapters = [(k, v) for k, v in tree_flatten(model.trainable_parameters())]
+    keys = mx.random.split(mx.random.key(1), len(adapters))
+    model.update(
+        tree_unflatten(
+            [
+                (k, mx.random.normal(v.shape, key=s) * 0.1)
+                for (k, v), s in zip(adapters, keys, strict=True)
+            ]
+        )
+    )
+    mx.eval(model.parameters())  # Test sync: materialize adapter weights.
+    inputs = prepare_completion_logprob_inputs(PROMPTS, COMPLETIONS)
+    weights = mx.arange(1, 5, dtype=mx.float32)[None, :]
+
+    got, got_grads = _logprobs_and_grads(model, inputs, weights)
+    monkeypatch.setattr(logprobs_module, "_completion_head", lambda m: None)
+    ref, ref_grads = _logprobs_and_grads(model, inputs, weights)
+
+    assert set(got_grads) == set(ref_grads) == {k for k, _ in adapters}
+    assert min(float(mx.max(mx.abs(g)).item()) for g in ref_grads.values()) > 0.0
+    loss_diff = abs(float(mx.sum(got * weights).item()) - float(mx.sum(ref * weights).item()))
+    grad_diff = max(_max_diff(got_grads[k], ref_grads[k]) for k in ref_grads)
+    assert _max_diff(got, ref) <= 1e-5
+    assert loss_diff <= 1e-4
+    assert grad_diff <= 1e-4
+
+
 def test_completion_head_sees_only_completion_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _tiny_model("qwen3", True)
     embed_cls = type(model.model.embed_tokens)
