@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -292,19 +294,9 @@ def _tiny_model(
     dtype: mx.Dtype = mx.float32,
     quantize: bool = False,
 ) -> nn.Module:
-    if arch == "qwen3":
-        from mlx_lm.models.qwen3 import Model, ModelArgs
-
-        extra = {"rope_theta": 10000.0, "head_dim": 8}
-    elif arch == "qwen2":
-        from mlx_lm.models.qwen2 import Model, ModelArgs
-
-        extra = {}
-    else:
-        from mlx_lm.models.llama import Model, ModelArgs
-
-        extra = {}
-    args = ModelArgs(
+    arch_module = importlib.import_module(f"mlx_lm.models.{arch}")
+    extra = {"rope_theta": 10000.0, "head_dim": 8} if arch == "qwen3" else {}
+    args = arch_module.ModelArgs(
         model_type=arch,
         hidden_size=32,
         num_hidden_layers=2,
@@ -317,9 +309,10 @@ def _tiny_model(
         tie_word_embeddings=tie,
         **extra,
     )
-    model = Model(args)
+    model = arch_module.Model(args)
     # Deterministic weights from a local key, independent of the global MLX RNG.
     leaves = tree_flatten(model.parameters())
+    assert isinstance(leaves, list)
     keys = mx.random.split(mx.random.key(0), len(leaves))
     model.update(
         tree_unflatten(
@@ -351,7 +344,7 @@ def _logprobs_and_grads(
 
 
 def _max_diff(a: mx.array, b: mx.array) -> float:
-    return float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item())
+    return float(mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))))
 
 
 @pytest.mark.parametrize(
@@ -391,7 +384,7 @@ def test_completion_head_matches_full_logits(
 
     assert _max_diff(got, ref) <= tol
     assert got.shape == ref.shape
-    assert max(float(mx.max(mx.abs(g)).item()) for g in ref_grads.values()) > 0.0
+    assert max(float(mx.max(mx.abs(g))) for g in ref_grads.values()) > 0.0
     assert max(_max_diff(got_grads[k], ref_grads[k]) for k in ref_grads) <= max(tol, 1e-4)
 
 
@@ -405,7 +398,9 @@ def test_completion_head_matches_full_logits_with_lora_and_checkpointing(
     model = _tiny_model("qwen3", True)
     inject_lora_adapters(model, LoRAConfig(rank=4, grad_checkpoint=True))
     # lora_b starts at zero, which would zero every lora_a gradient; make both factors live.
-    adapters = [(k, v) for k, v in tree_flatten(model.trainable_parameters())]
+    flat_adapters = tree_flatten(model.trainable_parameters())
+    assert isinstance(flat_adapters, list)
+    adapters = [(k, v) for k, v in flat_adapters]
     keys = mx.random.split(mx.random.key(1), len(adapters))
     model.update(
         tree_unflatten(
@@ -424,8 +419,8 @@ def test_completion_head_matches_full_logits_with_lora_and_checkpointing(
     ref, ref_grads = _logprobs_and_grads(model, inputs, weights)
 
     assert set(got_grads) == set(ref_grads) == {k for k, _ in adapters}
-    assert min(float(mx.max(mx.abs(g)).item()) for g in ref_grads.values()) > 0.0
-    loss_diff = abs(float(mx.sum(got * weights).item()) - float(mx.sum(ref * weights).item()))
+    assert min(float(mx.max(mx.abs(g))) for g in ref_grads.values()) > 0.0
+    loss_diff = abs(float(mx.sum(got * weights)) - float(mx.sum(ref * weights)))
     grad_diff = max(_max_diff(got_grads[k], ref_grads[k]) for k in ref_grads)
     assert _max_diff(got, ref) <= 1e-5
     assert loss_diff <= 1e-4
@@ -434,7 +429,9 @@ def test_completion_head_matches_full_logits_with_lora_and_checkpointing(
 
 def test_completion_head_sees_only_completion_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _tiny_model("qwen3", True)
-    embed_cls = type(model.model.embed_tokens)
+    backbone = model.model
+    assert backbone is not None
+    embed_cls = type(backbone.embed_tokens)
     original = embed_cls.as_linear
     seen: list[tuple[int, ...]] = []
 
@@ -451,7 +448,9 @@ def test_completion_head_sees_only_completion_rows(monkeypatch: pytest.MonkeyPat
 def test_subclass_with_overridden_call_uses_full_forward() -> None:
     base = _tiny_model("qwen3", True)
 
-    class Scaled(type(base)):  # type: ignore[misc]
+    base_cls: Any = type(base)
+
+    class Scaled(base_cls):  # type: ignore[misc]
         def __call__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             return super().__call__(*args, **kwargs) * 2
 

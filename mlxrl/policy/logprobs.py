@@ -169,7 +169,9 @@ def completion_logprobs_from_inputs(
             axis=1,
         )
     else:
-        hidden = model.model(inputs.input_ids)
+        backbone = model.model
+        assert backbone is not None
+        hidden = backbone(inputs.input_ids)
         index = inputs.gather_indices[..., None]
         hidden = mx.take_along_axis(
             hidden,
