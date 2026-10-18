@@ -275,6 +275,10 @@ currently exact for token-mean policy losses: base GRPO, DAPO, GSPO token mode,
 RLOO, and Dr. GRPO with `loss_reduction="token_mean"`. Sequence-reduced losses
 should keep `micro_batch_size=0`.
 
+Pass `shared_prefix=True` to `optimizer_step` (opt-in, off by default) to compute each
+unique prompt once per group; it supports stock mlx-lm Qwen2/Qwen3/Llama models and
+combines with `micro_batch_size` and `use_checkpoint`.
+
 ## ECHO World Modeling
 
 ECHO is an additive GiGPO trainer feature for tagged multi-turn trajectories.
