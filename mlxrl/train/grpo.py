@@ -21,6 +21,7 @@ from mlxrl.policy.logprobs import (
     prepare_completion_logprob_inputs,
 )
 from mlxrl.policy.model import enable_grad_checkpointing, temporary_eval_mode
+from mlxrl.policy.shared_prefix import shared_prefix_completion_logprobs
 from mlxrl.rollout.naive import Completion
 from mlxrl.train.reference import reference_logprobs_for_loss
 
@@ -212,13 +213,22 @@ def grpo_metrics_from_batch(
     pad_token_id: int,
     algorithm: Algorithm,
     use_checkpoint: bool = False,
+    shared_prefix: bool = False,
 ) -> AlgorithmLossMetrics:
     """Recompute policy logprobs and evaluate GRPO metrics."""
 
     if use_checkpoint:
         enable_grad_checkpointing(model)
     current = (
-        completion_logprobs_from_inputs(
+        shared_prefix_completion_logprobs(
+            model,
+            batch.prompt_token_ids,
+            batch.completion_token_ids,
+            pad_token_id,
+            use_checkpoint=use_checkpoint,
+        )
+        if shared_prefix
+        else completion_logprobs_from_inputs(
             model,
             batch.logprob_inputs,
             use_checkpoint=use_checkpoint,
@@ -258,6 +268,7 @@ def optimizer_step(
     algorithm: Algorithm,
     use_checkpoint: bool = False,
     micro_batch_size: int = 0,
+    shared_prefix: bool = False,
 ) -> StepMetrics:
     """Run value_and_grad over currently trainable adapter parameters once."""
 
@@ -283,6 +294,7 @@ def optimizer_step(
             pad_token_id,
             use_checkpoint=use_checkpoint,
             algorithm=algorithm,
+            shared_prefix=shared_prefix,
         )
         return metrics.loss, (
             metrics.policy_gradient_loss,
