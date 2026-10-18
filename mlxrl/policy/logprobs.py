@@ -158,13 +158,25 @@ def completion_logprobs_from_inputs(
 ) -> CompletionLogprobs:
     """Gather completion-token logprobs from prebuilt full-forward tensors."""
 
-    logits = _completion_forward(model, inputs.input_ids, use_checkpoint=use_checkpoint)
-    target_logprobs = target_logprobs_from_logits(logits, inputs.target_ids)
-    completion_logprob_values = mx.take_along_axis(
-        target_logprobs,
-        inputs.gather_indices,
-        axis=1,
-    )
+    head = _completion_head(model)
+    if head is None:
+        logits = _completion_forward(model, inputs.input_ids, use_checkpoint=use_checkpoint)
+        target_logprobs = target_logprobs_from_logits(logits, inputs.target_ids)
+        completion_logprob_values = mx.take_along_axis(
+            target_logprobs,
+            inputs.gather_indices,
+            axis=1,
+        )
+    else:
+        hidden = model.model(inputs.input_ids)
+        index = inputs.gather_indices[..., None]
+        hidden = mx.take_along_axis(
+            hidden,
+            mx.broadcast_to(index, (*index.shape[:2], hidden.shape[-1])),
+            axis=1,
+        )
+        targets = mx.take_along_axis(inputs.target_ids, inputs.gather_indices, axis=1)
+        completion_logprob_values = target_logprobs_from_logits(head(hidden), targets)
     completion_logprob_values = completion_logprob_values * inputs.mask.astype(
         completion_logprob_values.dtype
     )
@@ -314,6 +326,24 @@ def _require_row(row: mx.array | None) -> mx.array:
     if row is None:
         raise RuntimeError("Internal error: missing prefix-cached logprob row.")
     return row
+
+
+_PLAIN_HEAD_MODEL_TYPES = frozenset({"qwen2", "qwen3", "llama"})
+
+
+def _completion_head(model: nn.Module) -> Any | None:
+    """Output head when forward is backbone + plain head, else None (use full forward)."""
+
+    args = getattr(model, "args", None)
+    if getattr(args, "model_type", None) not in _PLAIN_HEAD_MODEL_TYPES:
+        return None
+    backbone = getattr(model, "model", None)
+    if backbone is None:
+        return None
+    if getattr(args, "tie_word_embeddings", False):
+        embed = getattr(backbone, "embed_tokens", None)
+        return getattr(embed, "as_linear", None)
+    return getattr(model, "lm_head", None)
 
 
 def _completion_forward(
