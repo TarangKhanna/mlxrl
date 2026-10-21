@@ -209,7 +209,7 @@ def test_clone_prompt_cache_is_independent(make) -> None:
     assert mx.array_equal(clone.keys[..., :5, :], keys).item()
     step = mx.ones((1, 2, 1, 8))
     clone.update_and_fetch(step, step)
-    assert (mx.array(clone.offset) - offset == 1).all().item()
+    assert mx.array_equal(mx.array(clone.offset) - offset, mx.ones_like(offset)).item()
     assert mx.array_equal(original.offset, offset).item()
     assert mx.array_equal(original.keys[..., :5, :], keys).item()
 
